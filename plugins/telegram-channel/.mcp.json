@@ -1,0 +1,30 @@
+{
+  "mcpServers": {
+    "telegram-channel": {
+      "command": "node",
+      "args": [
+        "./scripts/telegram-channel.mjs"
+      ],
+      "env_vars": [
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_ALLOWED_CHAT_IDS",
+        "TELEGRAM_ALLOWED_THREAD_IDS",
+        "TELEGRAM_ALLOWED_ROUTES",
+        "TELEGRAM_ALLOW_ALL_CHATS",
+        "TELEGRAM_POLL_TIMEOUT_SEC",
+        "TELEGRAM_OFFSET_FILE",
+        "TELEGRAM_DEBUG",
+        "TELEGRAM_SEEN_REACTION",
+        "TELEGRAM_DOWNLOAD_DIR",
+        "TELEGRAM_MAX_DOWNLOAD_BYTES"
+      ],
+      "channel": {
+        "enabled": true,
+        "mode": "queue",
+        "queue_capacity": 50,
+        "dedupe_capacity": 200,
+        "rate_limit_per_minute": 30
+      }
+    }
+  }
+}

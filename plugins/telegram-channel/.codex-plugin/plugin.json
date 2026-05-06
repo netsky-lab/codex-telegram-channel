@@ -1,0 +1,34 @@
+{
+  "name": "telegram-channel",
+  "version": "0.5.0",
+  "description": "Telegram channel bridge for pushing messages into a running Codex session.",
+  "author": {
+    "name": "netsky-lab",
+    "url": "https://github.com/netsky-lab"
+  },
+  "homepage": "https://github.com/netsky-lab/codex",
+  "repository": "https://github.com/netsky-lab/codex",
+  "license": "MIT",
+  "keywords": [
+    "telegram",
+    "channel",
+    "mcp"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Telegram Channel",
+    "shortDescription": "Bridge Telegram messages into the active Codex session.",
+    "longDescription": "Runs a local MCP channel server that polls a Telegram bot, forwards allowed chat messages, reply context, addressing hints, and downloaded attachments into the current Codex TUI session, and exposes reply, reaction, typing, and file upload tools for Telegram.",
+    "developerName": "netsky-lab",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Messaging",
+      "Files"
+    ],
+    "defaultPrompt": [
+      "When a Telegram channel message arrives, inspect metadata.addressing and metadata.reply_to. Answer with telegram_reply when the message is addressed to this bot or context clearly asks this bot, and avoid answering messages addressed to a different bot."
+    ],
+    "brandColor": "#229ED9"
+  }
+}

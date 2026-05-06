@@ -1,0 +1,20 @@
+{
+  "name": "netsky-lab",
+  "interface": {
+    "displayName": "Netsky Lab"
+  },
+  "plugins": [
+    {
+      "name": "telegram-channel",
+      "source": {
+        "source": "local",
+        "path": "./plugins/telegram-channel"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
