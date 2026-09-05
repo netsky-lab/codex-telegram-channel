@@ -2,6 +2,7 @@
   "mcpServers": {
     "telegram-channel": {
       "command": "node",
+      "cwd": ".",
       "args": [
         "./scripts/telegram-channel.mjs"
       ],

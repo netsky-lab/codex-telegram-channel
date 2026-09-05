@@ -2,6 +2,7 @@
 
 import readline from "node:readline";
 import { openAsBlob } from "node:fs";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -34,10 +35,14 @@ const offsetFile =
 const pollLockFile = process.env.TELEGRAM_POLL_LOCK_FILE ?? `${offsetFile}.lock`;
 const routeCacheFile = process.env.TELEGRAM_ROUTE_CACHE_FILE ?? `${offsetFile}.routes.json`;
 const maxTelegramMessageLength = 4096;
+const initialParentPid = process.ppid;
+const lockPayload = `${JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() })}\n`;
 
 let nextId = 1;
 let initialized = false;
+let channelConsumerAvailable = false;
 let polling = false;
+let shuttingDown = false;
 let pollLockStatus = "not_acquired";
 let pollLockHandle = null;
 let updateOffset = 0;
@@ -81,6 +86,9 @@ rl.on("line", async (line) => {
 
   try {
     if (message.id !== undefined) {
+      if (message.method === "initialize") {
+        channelConsumerAvailable = supportsChannelNotifications(message.params);
+      }
       await handleRequest(message);
     } else if (message.method === "notifications/initialized" || message.method === "initialized") {
       initialized = true;
@@ -95,6 +103,10 @@ rl.on("line", async (line) => {
   }
 });
 
+rl.on("close", () => {
+  void shutdown();
+});
+
 process.on("SIGINT", () => {
   void shutdown();
 });
@@ -102,8 +114,36 @@ process.on("SIGTERM", () => {
   void shutdown();
 });
 process.on("exit", () => {
-  void releasePollingLock();
+  releasePollingLockSync();
 });
+
+const parentWatchdog = setInterval(() => {
+  if (shuttingDown || initialParentPid <= 1) {
+    return;
+  }
+  if (process.ppid === 1) {
+    logError("Telegram channel parent process exited; shutting down bridge");
+    void shutdown();
+    return;
+  }
+  try {
+    process.kill(initialParentPid, 0);
+  } catch (error) {
+    if (error?.code === "ESRCH") {
+      logError("Telegram channel parent process is gone; shutting down bridge");
+      void shutdown();
+    }
+  }
+}, 5000);
+parentWatchdog.unref?.();
+
+const lockWatchdog = setInterval(() => {
+  if (!pollLockHandle || pollLockStatus !== "acquired" || shuttingDown) {
+    return;
+  }
+  void verifyPollingLock();
+}, 5000);
+lockWatchdog.unref?.();
 
 async function handleRequest(message) {
   switch (message.method) {
@@ -115,7 +155,7 @@ async function handleRequest(message) {
         },
         serverInfo: {
           name: "telegram-channel",
-          version: "0.5.0",
+          version: "0.5.2",
           title: "Telegram Channel",
         },
         instructions:
@@ -474,11 +514,55 @@ function sendToolResult(id, text, isError) {
 }
 
 function startPolling() {
-  if (polling || !initialized) {
-    return;
+  const state = pollingStartState();
+  return maybeStartPolling(state, () => {
+    logConfigWarnings();
+    void startPollingWithLock();
+  });
+}
+
+function supportsChannelNotifications(initializeParams) {
+  const capability =
+    initializeParams?.capabilities?.experimental?.["codex/channel-notifications"];
+  return capability?.schemaVersion === 1;
+}
+
+function pollingStartState() {
+  return {
+    polling,
+    initialized,
+    channelConsumerAvailable,
+    hasToken: Boolean(token),
+    hasAllowedRoutes:
+      allowedChatIds.size > 0 || allowedRoutes.size > 0 || allowAllChats,
+  };
+}
+
+function pollingWaitReason(state = pollingStartState()) {
+  if (state.polling) {
+    return null;
   }
-  logConfigWarnings();
-  void startPollingWithLock();
+  if (!state.initialized) {
+    return "awaiting_initialized";
+  }
+  if (!state.channelConsumerAvailable) {
+    return "no_channel_consumer";
+  }
+  if (!state.hasToken) {
+    return "missing_bot_token";
+  }
+  if (!state.hasAllowedRoutes) {
+    return "missing_allowed_routes";
+  }
+  return null;
+}
+
+function maybeStartPolling(state, startWithLock) {
+  if (state.polling || pollingWaitReason(state) !== null) {
+    return false;
+  }
+  startWithLock();
+  return true;
 }
 
 async function startPollingWithLock() {
@@ -507,7 +591,7 @@ async function pollLoop() {
   await ensureBotIdentity();
   updateOffset = await readOffset();
 
-  for (;;) {
+  while (!shuttingDown) {
     try {
       const result = await telegram("getUpdates", {
         offset: updateOffset,
@@ -522,6 +606,9 @@ async function pollLoop() {
         await writeOffset(updateOffset);
       }
     } catch (error) {
+      if (shuttingDown) {
+        break;
+      }
       logError(`Telegram polling failed: ${describeError(error)}`);
       await sleep(error.retryAfterMs ?? 3000);
     }
@@ -532,9 +619,7 @@ async function acquirePollingLock() {
   try {
     await fs.mkdir(path.dirname(pollLockFile), { recursive: true });
     pollLockHandle = await fs.open(pollLockFile, "wx", 0o600);
-    await pollLockHandle.writeFile(
-      `${JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() })}\n`,
-    );
+    await pollLockHandle.writeFile(lockPayload);
     pollLockStatus = "acquired";
     return true;
   } catch (error) {
@@ -553,6 +638,33 @@ async function acquirePollingLock() {
   }
 }
 
+async function verifyPollingLock() {
+  const raw = await fs.readFile(pollLockFile, "utf8").catch((error) => {
+    if (error?.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  });
+  if (raw === lockPayload) {
+    return;
+  }
+  if (raw === null) {
+    try {
+      await fs.writeFile(pollLockFile, lockPayload, { mode: 0o600, flag: "wx" });
+      logInfo(`Telegram polling lock restored: ${pollLockFile}`);
+      return;
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        logError(`Telegram polling lock restore failed: ${describeError(error)}`);
+      }
+    }
+  }
+
+  pollLockStatus = "lost";
+  logError(`Telegram polling lock lost to another process; shutting down bridge: ${pollLockFile}`);
+  void shutdown();
+}
+
 async function lockHeldByLiveProcess() {
   const raw = await fs.readFile(pollLockFile, "utf8").catch(() => "");
   const lock = safeJsonParse(raw);
@@ -562,6 +674,9 @@ async function lockHeldByLiveProcess() {
   }
   try {
     process.kill(pid, 0);
+    if (await isOrphanedTelegramBridge(pid)) {
+      return false;
+    }
     return true;
   } catch (error) {
     if (error?.code === "ESRCH") {
@@ -569,6 +684,32 @@ async function lockHeldByLiveProcess() {
     }
     return true;
   }
+}
+
+async function isOrphanedTelegramBridge(pid) {
+  if (pid === process.pid || process.platform !== "linux") {
+    return false;
+  }
+  try {
+    const [stat, cmdline] = await Promise.all([
+      fs.readFile(`/proc/${pid}/stat`, "utf8"),
+      fs.readFile(`/proc/${pid}/cmdline`, "utf8"),
+    ]);
+    const ppid = parseProcStatParentPid(stat);
+    return ppid === 1 && cmdline.includes("telegram-channel.mjs");
+  } catch {
+    return false;
+  }
+}
+
+function parseProcStatParentPid(stat) {
+  const end = stat.lastIndexOf(")");
+  if (end < 0) {
+    return undefined;
+  }
+  const fields = stat.slice(end + 2).trim().split(/\s+/);
+  const ppid = Number(fields[1]);
+  return Number.isSafeInteger(ppid) ? ppid : undefined;
 }
 
 function safeJsonParse(raw) {
@@ -580,6 +721,11 @@ function safeJsonParse(raw) {
 }
 
 async function shutdown() {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+  polling = false;
   await releasePollingLock();
   process.exit(0);
 }
@@ -595,6 +741,18 @@ async function releasePollingLock() {
     await fs.unlink(pollLockFile);
   } catch {
     // Best-effort cleanup; stale locks can be removed by deleting the lock file.
+  }
+}
+
+function releasePollingLockSync() {
+  if (!pollLockHandle) {
+    return;
+  }
+  pollLockHandle = null;
+  try {
+    fsSync.unlinkSync(pollLockFile);
+  } catch {
+    // Best-effort cleanup during process exit.
   }
 }
 
@@ -1296,7 +1454,9 @@ async function writeOffset(offset) {
 function statusText() {
   const lines = [
     `polling=${polling}`,
-    "channel_delivery=logging_notification_v1",
+    `polling_wait_reason=${pollingWaitReason() ?? "none"}`,
+    `channel_consumer=${channelConsumerAvailable ? "available" : "unavailable"}`,
+    "channel_delivery=custom_notification_v1",
     `debug=${telegramDebug}`,
     `poll_lock=${pollLockStatus}`,
     `poll_lock_file=${pollLockFile}`,
@@ -1357,6 +1517,41 @@ function summarizeUpdate(update) {
 }
 
 async function runSelfTest() {
+  if (
+    !supportsChannelNotifications({
+      capabilities: {
+        experimental: { "codex/channel-notifications": { schemaVersion: 1 } },
+      },
+    })
+    || supportsChannelNotifications({ capabilities: { experimental: {} } })
+    || supportsChannelNotifications({
+      capabilities: {
+        experimental: { "codex/channel-notifications": { schemaVersion: 2 } },
+      },
+    })
+  ) {
+    throw new Error("supportsChannelNotifications self-test failed");
+  }
+  let pollingStarts = 0;
+  const startProbe = () => {
+    pollingStarts += 1;
+  };
+  const readyState = {
+    polling: false,
+    initialized: true,
+    channelConsumerAvailable: true,
+    hasToken: true,
+    hasAllowedRoutes: true,
+  };
+  if (
+    maybeStartPolling({ ...readyState, channelConsumerAvailable: false }, startProbe)
+    || maybeStartPolling({ ...readyState, hasToken: false }, startProbe)
+    || maybeStartPolling({ ...readyState, hasAllowedRoutes: false }, startProbe)
+    || !maybeStartPolling(readyState, startProbe)
+    || pollingStarts !== 1
+  ) {
+    throw new Error("polling capability gate self-test failed");
+  }
   const chunks = splitTelegramMessage("x".repeat(maxTelegramMessageLength + 2));
   if (chunks.length !== 2 || chunks[0].length !== maxTelegramMessageLength || chunks[1].length !== 2) {
     throw new Error("splitTelegramMessage self-test failed");
@@ -1436,6 +1631,9 @@ async function runSelfTest() {
   if (sanitizeFileName("../bad:name.png") !== "..-bad-name.png") {
     throw new Error("sanitizeFileName self-test failed");
   }
+  if (parseProcStatParentPid("123 (telegram channel) S 456 0 0 0") !== 456) {
+    throw new Error("parseProcStatParentPid self-test failed");
+  }
   botIdentity = { id: "42", username: "syncera_research_bot" };
   const addressed = computeAddressing(
     {
@@ -1470,6 +1668,9 @@ async function runSelfTest() {
     throw new Error("computeAddressing other bot reply self-test failed");
   }
   const status = statusText();
+  if (!status.includes("channel_delivery=custom_notification_v1")) {
+    throw new Error("custom notification delivery self-test failed");
+  }
   const hasDebugStatus = status.includes("last_update=");
   if (hasDebugStatus !== telegramDebug) {
     throw new Error("telegram_status debug gating self-test failed");
@@ -1504,14 +1705,7 @@ function sendNotification(method, params) {
 }
 
 function sendChannelNotification(method, params) {
-  sendNotification("notifications/message", {
-    level: "info",
-    logger: "codex-channel",
-    data: {
-      method,
-      params,
-    },
-  });
+  sendNotification(method, params);
 }
 
 function logError(message) {

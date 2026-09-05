@@ -2,6 +2,13 @@
 
 Local MCP channel bridge for Codex.
 
+This plugin release targets Codex 0.153.4. It requires a Codex build with MCP
+channel notifications enabled.
+
+Inbound polling starts only when the connected Codex client advertises the
+`codex/channel-notifications` capability with `schemaVersion: 1`. Discovery and
+status-only clients can still use the tools without consuming Telegram updates.
+
 ## Setup
 
 Install the marketplace:
